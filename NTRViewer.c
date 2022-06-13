@@ -103,10 +103,10 @@ static inline uint32_t NativeToLE(uint32_t in) {
 #endif
 }
 
-int16_t circle_x = 0;
-int16_t circle_y = 0;
-int16_t cstick_x = 0;
-int16_t cstick_y = 0;
+int32_t circle_x = 0;
+int32_t circle_y = 0;
+int32_t cstick_x = 0;
+int32_t cstick_y = 0;
 
 uint32_t hid_buttons = 0xfffff000;
 uint32_t special_buttons = 0;
@@ -130,10 +130,10 @@ int16_t touch_y = 0;
 
 uint32_t tomap[] =
 {
-	0,
 	1,
-	10,
+	0,
 	11,
+	10,
 	2,
 	100, // PS button
 	3,
@@ -213,10 +213,6 @@ int SendInputRedirection(int input)
 	uint32_t cstick_state = 0x80800081;
 	uint32_t touch_state = 0x2000000;
 	
-	/*short x_joy, y_joy;
-	circle_x = x_joy = SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_LEFTX);
-	circle_y = y_joy = SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_LEFTY);*/
-	
 	if(circle_x != 0 || circle_y != 0) // Do circle magic. 0x5d0 is the upper/lower bound of circle pad input
 	{
 		uint32_t x = circle_x;
@@ -238,14 +234,16 @@ int SendInputRedirection(int input)
 		cstick_state = (yy&0xff) << 24 | (xx&0xff) << 16 | (zlzr_state&0xff) << 8 | 0x81;
 	}
 
-	/*if(touching) // This is good enough.
+	if(touching) // This is good enough.
 	{
 		uint32_t x = touch_x;
 		uint32_t y = touch_y;
-		x = (x * 4096) / window_w;
-		y = (y * 4096) / window_h;
+		x = (x * 4096) / 320;
+		y = (y * 4096) / 240;
+		//x = (x * 4096) / window_w;
+		//y = (y * 4096) / window_h;
 		touch_state = x | (y << 12) | (0x01 << 24);
-	}*/
+	}
 
 	memcpy(v, &hid_state, 4);
 	memcpy(v + 4, &touch_state, 4);
@@ -442,7 +440,6 @@ int recoverFrame(int isTop, int addr) {
 
 int socketThreadMain(void* lpParameter)
 {
-
 	int ret;
 	int serSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
 	if (serSocket == -1)
@@ -483,9 +480,9 @@ int socketThreadMain(void* lpParameter)
     timeout.tv_sec = 1;
     timeout.tv_usec = 0;
 
-    ret = setsockopt(serSocket, SOL_SOCKET, SO_RCVTIMEO, (char *) &timeout,
-            sizeof (timeout));
-        if (ret) {
+    ret = setsockopt(serSocket, SOL_SOCKET, SO_RCVTIMEO, (char *) &timeout, sizeof (timeout));
+	if (ret) 
+	{
         printf("set recv timeout failed, ret: %d\n", ret);
         return 0;
     }
@@ -635,8 +632,6 @@ void mainLoop() {
 
 	}*/
 
-	
-	
     SDL_Thread *thread;
     thread = SDL_CreateThread(socketThreadMain, "Superthread", (void *)NULL);
 
@@ -644,6 +639,8 @@ void mainLoop() {
 
 	SDL_Event e;
 	uint8_t quit = 0;
+	uint32_t b;
+
 	while (!quit){
 		while (SDL_PollEvent(&e))
 		{
@@ -666,13 +663,39 @@ void mainLoop() {
 				case SDL_CONTROLLERAXISMOTION:
 					switch (e.caxis.axis)
 					{
-					/* LEFT && RIGHT Stick Movement */
-					case SDL_CONTROLLER_AXIS_LEFTX:
-						circle_x = e.caxis.value;
+						case SDL_CONTROLLER_AXIS_LEFTX:
+							circle_x = e.caxis.value;
 						break;
-					/* UP && DOWN Stick Movement */
-					case SDL_CONTROLLER_AXIS_LEFTY:
-						circle_y = e.caxis.value;
+						case SDL_CONTROLLER_AXIS_LEFTY:
+							circle_y = -e.caxis.value;
+						break;
+						case SDL_CONTROLLER_AXIS_RIGHTX:
+							cstick_x = e.caxis.value;
+						break;
+						case SDL_CONTROLLER_AXIS_RIGHTY:
+							cstick_y = -e.caxis.value;
+						break;
+						case SDL_CONTROLLER_AXIS_TRIGGERLEFT:
+						b = 0x4;
+						if(e.caxis.value > 2000)
+						{
+							zlzr_state |= b;
+						}
+						else
+						{
+							zlzr_state &= ~b;
+						}
+						break;
+						case SDL_CONTROLLER_AXIS_TRIGGERRIGHT:
+						b = 0x2;
+						if(e.caxis.value > 2000)
+						{
+							zlzr_state |= b;
+						}
+						else
+						{
+							zlzr_state &= ~b;
+						}
 						break;
 					}
 				break;
@@ -728,7 +751,22 @@ void mainLoop() {
 					}
 
 				break;
-
+				case SDL_MOUSEMOTION:
+					if (e.motion.x > 1600 && e.motion.y > 420)
+					{
+						touch_x = e.motion.x - 1600;
+						touch_y = e.motion.y - 420;
+					}
+				break;
+				case SDL_MOUSEBUTTONDOWN:
+					if (e.motion.x > 1600 && e.motion.y > 420)
+					{
+						touching = 1;
+					}
+				break;
+				case SDL_MOUSEBUTTONUP:
+					touching = 0;
+				break;
 			}
 
 		}
@@ -899,6 +937,8 @@ int main(int argc, char* argv[])
 	if (strlen(activateStreamingHost) > 0) {
         activateStreaming(activateStreamingHost);
     }
+    
+    SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS,"1");
 
 	if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER) != 0) {
 		return 0;
