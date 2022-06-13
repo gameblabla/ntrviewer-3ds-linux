@@ -14,12 +14,20 @@
 #include <unistd.h>
 #include <pthread.h>
 
+#include <netdb.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+
 #define u8 uint8_t
 #define u16 uint16_t
 #define u32 uint32_t
 
 #define PACKET_SIZE (1448)
 #define WINAPI
+
+#define BIT(n) (1U<<(n))
 
 float topScaleFactor = 1;
 float botScaleFactor = 1;
@@ -79,6 +87,174 @@ int jpegQuality = 80;
 float qosValue = 30.0;
 
 void activateStreaming(char* host);
+
+static int input_sock = -1;
+struct sockaddr_in client_addr;
+
+SDL_GameController *pad;
+SDL_Joystick *joy;
+short instanceID;
+
+static inline uint32_t NativeToLE(uint32_t in) {
+#ifdef IS_BIG_ENDIAN
+    return __builtin_bswap32(in);
+#else
+    return in;
+#endif
+}
+
+int16_t circle_x = 0;
+int16_t circle_y = 0;
+int16_t cstick_x = 0;
+int16_t cstick_y = 0;
+
+uint32_t hid_buttons = 0xfffff000;
+uint32_t special_buttons = 0;
+uint32_t zlzr_state = 0;
+
+int8_t touching = 0;
+int16_t touch_x = 0;
+int16_t touch_y = 0;
+
+
+#define JOY_DEADZONE 1700
+#define CPAD_BOUND 0x5d0
+#define CPP_BOUND 0x7f
+
+#define ACCEPTING_INPUT 0
+#define MENU_KEYBOARD 1
+#define MENU_JOYPAD 2
+#define MENU_NET 3
+#define MENU_INFO 4
+
+
+uint32_t tomap[] =
+{
+	0,
+	1,
+	10,
+	11,
+	2,
+	100, // PS button
+	3,
+	100, //7
+	100, //8
+	9, //9
+	8, //10
+};
+
+uint32_t hid_values[] =
+{
+	BIT(0), ///< A
+	BIT(1), ///< B
+	BIT(2), ///< Select
+	BIT(3), ///< Start
+	BIT(4), ///< D-Pad Right
+	BIT(5), ///< D-Pad Left
+	BIT(6), ///< D-Pad Up
+	BIT(7), ///< D-Pad Down
+	BIT(8), ///< R
+	BIT(9), ///< L
+	BIT(10), ///< X
+	BIT(11), //< Y
+};
+
+uint32_t special_values[] =
+{
+	BIT(0), // HOME
+	BIT(1), // Power
+	BIT(2)  // Power(long)
+};
+
+
+int sock_fd;
+struct sockaddr_in sock_addr;
+
+int connect_to_3ds(const char *addr)
+{
+	sock_fd = socket(AF_INET, SOCK_DGRAM, 0);
+
+	struct addrinfo hints;
+	memset(&hints, 0, sizeof hints);
+	hints.ai_family = AF_INET;
+	hints.ai_socktype = SOCK_DGRAM;
+
+	memset(&sock_addr, 0, sizeof(sock_addr));
+	sock_addr.sin_family = AF_INET;
+	sock_addr.sin_port = htons(4950);
+
+	struct addrinfo *res;
+	int r = getaddrinfo(addr, "4950", &hints, &res);
+	if (r != 0)
+	{
+		printf("Can't connect to IP\n");
+		close(sock_fd);
+		return 1;
+	}
+
+	struct addrinfo *s;
+	for (s = res; s != NULL; s = s->ai_next)
+	{
+		memcpy(&sock_addr, s->ai_addr, s->ai_addrlen);
+	}
+	freeaddrinfo(res);
+
+	printf("Good\n");
+
+	return 0;
+}
+
+int SendInputRedirection(int input) 
+{
+	if(sock_fd == -1) return;
+	char v[20];
+	uint32_t hid_state = ~hid_buttons;
+	uint32_t circle_state = 0x7ff7ff;
+	uint32_t cstick_state = 0x80800081;
+	uint32_t touch_state = 0x2000000;
+	
+	/*short x_joy, y_joy;
+	circle_x = x_joy = SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_LEFTX);
+	circle_y = y_joy = SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_LEFTY);*/
+	
+	if(circle_x != 0 || circle_y != 0) // Do circle magic. 0x5d0 is the upper/lower bound of circle pad input
+	{
+		uint32_t x = circle_x;
+		uint32_t y = circle_y;
+		x = ((x * CPAD_BOUND) / 32768) + 2048;
+		y = ((y * CPAD_BOUND) / 32768) + 2048;
+		circle_state = x | (y << 12);
+	}
+
+	if(cstick_x != 0 || cstick_y != 0 || zlzr_state != 0)
+	{
+		double x = cstick_x / 32768.0;
+		double y = cstick_y / 32768.0;
+
+		// We have to rotate the c-stick position 45deg. Thanks, Nintendo.
+		uint32_t xx = (uint32_t)((x+y) * M_SQRT1_2 * CPP_BOUND) + 0x80;
+		uint32_t yy = (uint32_t)((y-x) * M_SQRT1_2 * CPP_BOUND) + 0x80;
+
+		cstick_state = (yy&0xff) << 24 | (xx&0xff) << 16 | (zlzr_state&0xff) << 8 | 0x81;
+	}
+
+	/*if(touching) // This is good enough.
+	{
+		uint32_t x = touch_x;
+		uint32_t y = touch_y;
+		x = (x * 4096) / window_w;
+		y = (y * 4096) / window_h;
+		touch_state = x | (y << 12) | (0x01 << 24);
+	}*/
+
+	memcpy(v, &hid_state, 4);
+	memcpy(v + 4, &touch_state, 4);
+	memcpy(v + 8, &circle_state, 4);
+	memcpy(v + 12, &cstick_state, 4);
+	memcpy(v + 16, &special_buttons, 4);
+
+	int i = sendto(sock_fd, v, 20, 0, (struct sockaddr*)&sock_addr, sizeof(struct sockaddr_in));
+}
 
 void printTime() {
 	time_t rawtime;
@@ -441,6 +617,7 @@ int socketThreadMain(void* lpParameter)
 
 
 void mainLoop() {
+	int ee;
 	const float real_FPS = 1000/60;
 	//SDL_Rect topRect = { 0, 0, 400, 240 };
 	//SDL_Rect botRect = { 40, 240, 320, 240 };
@@ -468,14 +645,98 @@ void mainLoop() {
 	SDL_Event e;
 	uint8_t quit = 0;
 	while (!quit){
-		while (SDL_PollEvent(&e)){
-			if (e.type == SDL_QUIT){
-				quit = 1;
+		while (SDL_PollEvent(&e))
+		{
+			switch(e.type)
+			{
+				case SDL_QUIT:
+					quit = 1;
+				break;
+				case SDL_CONTROLLERDEVICEADDED:
+					if( SDL_IsGameController( 0 ) ) 
+					{
+						pad = SDL_GameControllerOpen( 0 );
+						if (pad) 
+						{
+							joy = SDL_GameControllerGetJoystick( pad );
+							instanceID = SDL_JoystickInstanceID( joy );
+						}
+					}
+				break;
+				case SDL_CONTROLLERAXISMOTION:
+					switch (e.caxis.axis)
+					{
+					/* LEFT && RIGHT Stick Movement */
+					case SDL_CONTROLLER_AXIS_LEFTX:
+						circle_x = e.caxis.value;
+						break;
+					/* UP && DOWN Stick Movement */
+					case SDL_CONTROLLER_AXIS_LEFTY:
+						circle_y = e.caxis.value;
+						break;
+					}
+				break;
+				case SDL_CONTROLLERBUTTONDOWN:
+					ee = e.cbutton.button;
+					switch(ee)
+					{
+						case 5:
+							special_buttons |= special_values[0];
+						break;
+						/* D-PAD */
+						case 11:
+							hid_buttons |= hid_values[6];
+						break;
+						case 12:
+							hid_buttons |= hid_values[7];
+						break;	
+						case 13:
+							hid_buttons |= hid_values[5];
+						break;
+						case 14:
+							hid_buttons |= hid_values[4];
+						break;
+						default:
+							hid_buttons |= hid_values[tomap[ee]];
+						break;
+					}
+					
+				break;
+				case SDL_CONTROLLERBUTTONUP:
+					ee = e.cbutton.button;
+					switch(ee)
+					{
+						case 5:
+							special_buttons &= ~special_values[0];
+						break;
+						/* D-PAD */
+						case 11:
+							hid_buttons &= ~hid_values[6];
+						break;
+						case 12:
+							hid_buttons &= ~hid_values[7];
+						break;
+						case 13:
+							hid_buttons &= ~hid_values[5];
+						break;
+						case 14:
+							hid_buttons &= ~hid_values[4];
+						break;
+						default:
+							hid_buttons &= ~hid_values[tomap[ee]];
+						break;
+					}
+
+				break;
+
 			}
+
 		}
 		
 		Uint32 start;
 		start = SDL_GetTicks();
+		
+		SendInputRedirection(0);
 		
 		/*if (topRequireUpdate) {
 			topRequireUpdate = 0;
@@ -547,7 +808,7 @@ int buildPacket(u32* buf, u32 type, u32 cmd, u32 arg0, u32 arg1, u32 arg2, u32 a
 void activateStreaming(char* host) {
     u32 buf[64];
     
-    struct sockaddr_in client_addr;
+  
     client_addr.sin_family = AF_INET;   
     client_addr.sin_addr.s_addr = htons(INADDR_ANY);
     client_addr.sin_port = htons(0);    
@@ -617,6 +878,8 @@ void activateStreaming(char* host) {
         sleep(1);
     }
 	close(client_socket);
+	
+	connect_to_3ds(host);
 }
 
 
@@ -637,7 +900,7 @@ int main(int argc, char* argv[])
         activateStreaming(activateStreamingHost);
     }
 
-	if (SDL_Init(SDL_INIT_VIDEO) != 0) {
+	if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER) != 0) {
 		return 0;
 	}
 
@@ -649,7 +912,7 @@ int main(int argc, char* argv[])
 		screenWidth = 400 * topScaleFactor ;
 		screenHeight = 240 * topScaleFactor + 240 * botScaleFactor;
 	}
-	mainWindow = SDL_CreateWindow("NTRViewer", 100, 100, 1920, 1080, 0);
+	mainWindow = SDL_CreateWindow("NTRViewer", 0, 0, 1920, 1080, SDL_WINDOW_FULLSCREEN_DESKTOP);
 	renderer = SDL_CreateRenderer(mainWindow, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
 	//SDL_RenderSetScale(renderer, topScaleFactor, topScaleFactor);
 	if (!renderer) {
